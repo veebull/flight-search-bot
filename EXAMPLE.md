@@ -1,0 +1,1 @@
+https://api.travelpayouts.com/aviasales/v3/prices_for_dates?origin=USK&destination=UFA&departure_at=2025-08-05&unique=false&sorting=price&direct=false&cy=usd&limit=30&page=1&one_way=true&token=f913110a48f6e7ccda029bfead6b90e3

@@ -1,0 +1,17 @@
+# Rust specific ignores
+/target/
+Cargo.lock
+**/*.rs.bk
+
+# Environment files (since your project uses dotenv)
+.env
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db
