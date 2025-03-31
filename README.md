@@ -20,6 +20,10 @@ This Rust application periodically checks for available flights between specifie
    - `TELEGRAM_DEVLOGS_TOPIC_ID`: Topic ID for development logs
    - `TELEGRAM_FOUND_TOPIC_ID`: Topic ID for found flights
    - `AIRLABS_API_KEY`: Your AirLabs API key (optional)
+   - `ORIGIN`: Origin airport code in IATA format (e.g., UFA)
+   - `DESTINATION`: Destination airport code in IATA format (e.g., USK)
+   - `START_DATE`: Start date for search range in ISO 8601 format (YYYY-MM-DD)
+   - `END_DATE`: End date for search range in ISO 8601 format (YYYY-MM-DD)
 3. Run with `cargo run`
 
 ## Configuration
