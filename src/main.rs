@@ -598,6 +598,222 @@ async fn enrich_with_airlabs_data(
     }
 }
 
+// Add these new structs to track search statistics
+#[derive(Debug, Default)]
+struct SearchStatistics {
+    total_dates_checked: usize,
+    dates_with_flights: usize,
+    dates_without_flights: usize,
+    total_flights_found: usize,
+    errors_encountered: usize,
+    flight_dates: Vec<String>,
+}
+
+impl SearchStatistics {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn format_summary(&self) -> String {
+        let mut summary = format!(
+            "📊 <b>Статистика поиска:</b>\n\
+             ✓ Проверено дат: {}\n\
+             ✈️ Даты с рейсами: {}\n\
+             ❌ Даты без рейсов: {}\n\
+             🎫 Всего найдено рейсов: {}\n\
+             ⚠️ Ошибок: {}\n",
+            self.total_dates_checked,
+            self.dates_with_flights,
+            self.dates_without_flights,
+            self.total_flights_found,
+            self.errors_encountered
+        );
+        
+        if !self.flight_dates.is_empty() {
+            summary.push_str("\n<b>Даты с найденными рейсами:</b>\n");
+            for date in &self.flight_dates {
+                summary.push_str(&format!("• {}\n", date));
+            }
+        }
+        
+        summary
+    }
+}
+
+// Add this function to update a Telegram message
+async fn update_telegram_message(
+    client: &Client,
+    bot_token: &str,
+    chat_id: &str,
+    message_id: &str,
+    message: &str,
+    topic_id: &str,
+) -> Result<(), Box<dyn Error>> {
+    let api_url = format!("https://api.telegram.org/bot{}/editMessageText", bot_token);
+    
+    let mut json_body = json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": true
+    });
+
+    // Add message_thread_id only if topic_id is not empty and not "1"
+    if !topic_id.is_empty() && topic_id != "1" {
+        json_body["message_thread_id"] = json!(topic_id);
+    }
+    
+    // Implement exponential backoff for rate limiting
+    let mut retry_count = 0;
+    let max_retries = 5;
+    let initial_delay = 1; // seconds
+    
+    loop {
+        let response = client
+            .post(&api_url)
+            .json(&json_body)
+            .send()
+            .await?;
+        
+        if response.status().is_success() {
+            // Add a small delay to avoid Telegram rate limits
+            time::sleep(Duration::from_millis(1000)).await;
+            return Ok(());
+        } else {
+            let status = response.status();
+            let text = response.text().await?;
+                
+            // If we hit the rate limit (429 Too Many Requests)
+            if status.as_u16() == 429 {
+                retry_count += 1;
+                
+                if retry_count > max_retries {
+                    return Err(format!("Exceeded maximum retries for Telegram API. Last error: {}", text).into());
+                }
+                
+                // Extract retry_after from response if available
+                let retry_after = if let Ok(error_json) = serde_json::from_str::<serde_json::Value>(&text) {
+                    error_json.get("parameters")
+                        .and_then(|p| p.get("retry_after"))
+                        .and_then(|r| r.as_f64())
+                        .unwrap_or_else(|| {
+                            // Calculate exponential backoff if retry_after not provided
+                            let backoff = initial_delay * 2_u64.pow(retry_count as u32);
+                            backoff as f64
+                        })
+                } else {
+                    // Fallback exponential backoff
+                    let backoff = initial_delay * 2_u64.pow(retry_count as u32);
+                    backoff as f64
+                };
+                
+                let wait_time = Duration::from_secs_f64(retry_after);
+                eprintln!("Telegram API rate limited (429). Waiting for {} seconds before retry {}/{}...", 
+                    wait_time.as_secs(), retry_count, max_retries);
+                
+                time::sleep(wait_time).await;
+            } else {
+                // Other error, not rate limiting
+                eprintln!("Telegram API request failed with status {}: {}", status, text);
+                return Err(format!("Telegram API request failed: {}", text).into());
+            }
+        }
+    }
+}
+
+// Function to send a message and return the message ID
+async fn send_telegram_notification_with_id(
+    client: &Client,
+    bot_token: &str,
+    chat_id: &str,
+    message: &str,
+    topic_id: &str,
+    inline_keyboard: Option<serde_json::Value>,
+) -> Result<String, Box<dyn Error>> {
+    let api_url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
+    
+    let mut json_body = json!({
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": true
+    });
+
+    // Add message_thread_id only if topic_id is not empty and not "1"
+    if !topic_id.is_empty() && topic_id != "1" {
+        json_body["message_thread_id"] = json!(topic_id);
+    }
+    
+    if let Some(keyboard) = inline_keyboard {
+        json_body["reply_markup"] = keyboard;
+    }
+    
+    // Implement exponential backoff for rate limiting
+    let mut retry_count = 0;
+    let max_retries = 5;
+    let initial_delay = 1; // seconds
+    
+    loop {
+        let response = client
+            .post(&api_url)
+            .json(&json_body)
+            .send()
+            .await?;
+        
+        if response.status().is_success() {
+            // Parse the response to get the message ID
+            let response_text = response.text().await?;
+            let response_json: serde_json::Value = serde_json::from_str(&response_text)?;
+            
+            let message_id = response_json
+                .get("result")
+                .and_then(|result| result.get("message_id"))
+                .and_then(|id| id.as_i64())
+                .ok_or("Failed to get message ID from Telegram response")?;
+            
+            // Add a small delay to avoid Telegram rate limits
+            time::sleep(Duration::from_millis(1000)).await;
+            return Ok(message_id.to_string());
+        } else {
+            // ... existing error handling ...
+            // Same as in send_telegram_notification function
+            let status = response.status();
+            let text = response.text().await?;
+                
+            if status.as_u16() == 429 {
+                retry_count += 1;
+                
+                if retry_count > max_retries {
+                    return Err(format!("Exceeded maximum retries for Telegram API. Last error: {}", text).into());
+                }
+                
+                let retry_after = if let Ok(error_json) = serde_json::from_str::<serde_json::Value>(&text) {
+                    error_json.get("parameters")
+                        .and_then(|p| p.get("retry_after"))
+                        .and_then(|r| r.as_f64())
+                        .unwrap_or_else(|| {
+                            let backoff = initial_delay * 2_u64.pow(retry_count as u32);
+                            backoff as f64
+                        })
+                } else {
+                    let backoff = initial_delay * 2_u64.pow(retry_count as u32);
+                    backoff as f64
+                };
+                
+                let wait_time = Duration::from_secs_f64(retry_after);
+                eprintln!("Telegram API rate limited (429). Waiting for {} seconds before retry {}/{}...", 
+                    wait_time.as_secs(), retry_count, max_retries);
+                
+                time::sleep(wait_time).await;
+            } else {
+                eprintln!("Telegram API request failed with status {}: {}", status, text);
+                return Err(format!("Telegram API request failed: {}", text).into());
+            }
+        }
+    }
+}
+
 // TODO: Create schedule checker for date from 15 sept 2025 to 30 sept 2025
 // for available dates in the aero flights aviasales.ru each 6 hours
 #[tokio::main]
@@ -677,50 +893,75 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Create date range string for display
     let date_range_str = format_date_range_ru(&start_date, &end_date);
     
-    // Send startup notification
-    if enable_telegram {
-        let origin_name = get_city_name(&origin);
-        let destination_name = get_city_name(&destination);
-        let startup_message = format!(
-            "🛫 Программа поиска авиабилетов запущена!\n\n\
-             Будет проверять прямые рейсы из {} в {} {}.\nПоиск будет происходить каждые 6 часов.",
-            origin_name, destination_name, date_range_str
-        );
-        
-        // Send startup message to all notification channels
-        send_telegram_notification(
-            &client, 
-            &telegram_bot_token, 
-            &telegram_chat_id, 
-            &startup_message, 
-            &telegram_devlogs_topic_id, 
-            None
-        ).await?;
+    // Initialize statistics tracking
+    let mut stats = SearchStatistics::new();
+    let mut status_message_id: Option<String> = None;
 
-    }
-    
     let dates = date_range(start_date, end_date);
     
     // Check flights every 6 hours
     let hours_interval = 6;
     let check_interval = Duration::from_secs(hours_interval * 60 * 60);
     
+    // Send startup notification
+    if enable_telegram {
+        let origin_name = get_city_name(&origin);
+        let destination_name = get_city_name(&destination);
+        let startup_message = format!(
+            "🛫 <b>Программа поиска авиабилетов запущена!</b>\n\n\
+             Будет проверять прямые рейсы из <b>{}</b> в <b>{}</b> {}.\n\
+             Поиск будет происходить каждые {} часов.\n\n\
+             <i>Этот статус будет обновляться с результатами поиска.</i>",
+            origin_name, destination_name, date_range_str, hours_interval
+        );
+        
+        // Send startup message and store message ID
+        match send_telegram_notification_with_id(
+            &client, 
+            &telegram_bot_token, 
+            &telegram_chat_id, 
+            &startup_message, 
+            &telegram_devlogs_topic_id, 
+            None
+        ).await {
+            Ok(message_id) => {
+                status_message_id = Some(message_id.clone());
+                println!("Status message created with ID: {}", message_id);
+            },
+            Err(e) => {
+                eprintln!("Failed to send initial status message: {}", e);
+            }
+        }
+    }
+    
     loop {
+        // Reset statistics for this search cycle
+        stats = SearchStatistics::new();
+        
         let search_start_time = Utc::now();
         let formatted_start_time = format_utc_datetime_ru(search_start_time);
         println!("Starting flight search at {}", formatted_start_time);
         
-        if enable_telegram {
-            let cycle_start_message = format!("🔍 Начинаю цикл поиска рейсов {}", formatted_start_time);
-            // Only send to devlogs topic
-            send_telegram_notification(
+        if enable_telegram && status_message_id.is_some() {
+            let cycle_start_message = format!(
+                "🛫 <b>Программа поиска авиабилетов</b>\n\n\
+                🔍 Начат цикл поиска рейсов: {}\n\
+                🗓 Проверяемые даты: {}\n\n\
+                <i>Статус будет обновляться...</i>",
+                formatted_start_time, date_range_str
+            );
+            
+            // Update status message
+            if let Err(e) = update_telegram_message(
                 &client, 
                 &telegram_bot_token, 
                 &telegram_chat_id, 
+                &status_message_id.as_ref().unwrap(), 
                 &cycle_start_message, 
-                &telegram_devlogs_topic_id, 
-                None
-            ).await?;
+                &telegram_devlogs_topic_id
+            ).await {
+                eprintln!("Failed to update status message: {}", e);
+            }
         }
         
         for date in &dates {
@@ -747,6 +988,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 date.year()
             );
             
+            // Update statistics for checked date
+            stats.total_dates_checked += 1;
+            
             match search_flights(&client, &origin, &destination, &departure_date, &aviasales_api_key).await {
                 Ok(flight_data) => {
                     if flight_data.success {
@@ -758,11 +1002,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let destination_name = get_city_name(&destination);
                             
                             if flight_count > 0 {
+                                // Update statistics
+                                stats.dates_with_flights += 1;
+                                stats.total_flights_found += flight_count;
+                                stats.flight_dates.push(formatted_date.clone());
+                                
                                 // Prepare flight details for Telegram
                                 let mut telegram_message = format!("✅ Найдено <b>{} рейсов</b> на <b>{}</b> из {} в {}:\n\n", 
                                     flight_count, formatted_date, origin_name, destination_name);
                                 
-                                // Send to both primary and secondary chats if enabled
+                                // Update status message with current progress
+                                if enable_telegram && status_message_id.is_some() {
+                                    let progress_message = format!(
+                                        "🛫 <b>Программа поиска авиабилетов</b>\n\n\
+                                        🔍 Поиск начат: {}\n\
+                                        🗓 Проверяемые даты: {}\n\n\
+                                        {}\n\n\
+                                        <i>Поиск в процессе ({}/{} дат проверено)...</i>",
+                                        formatted_start_time,
+                                        date_range_str,
+                                        stats.format_summary(),
+                                        stats.total_dates_checked,
+                                        dates.len()
+                                    );
+                                    
+                                    if let Err(e) = update_telegram_message(
+                                        &client,
+                                        &telegram_bot_token,
+                                        &telegram_chat_id,
+                                        &status_message_id.as_ref().unwrap(),
+                                        &progress_message,
+                                        &telegram_devlogs_topic_id
+                                    ).await {
+                                        eprintln!("Failed to update status message: {}", e);
+                                    }
+                                }
+                                
+                                // Send flight details to the FOUND_TOPIC channel
                                 for (i, flight) in flights.iter().enumerate() {
                                     if i >= 5 {
                                         // Limit to 5 flights in a single message
@@ -826,18 +1102,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         ]
                                     });
                                     
-                                    // Send flight notifications to all relevant topics
+                                    // Only send flight info to the FOUND topic
                                     if enable_telegram {
-                                        // Important flight finds go to both topics
-                                        let topic_ids = vec![telegram_devlogs_topic_id.clone(), telegram_found_topic_id.clone()];
-                                        send_telegram_multi_topic_notification(
-                                        &client, 
-                                        &telegram_bot_token, 
-                                        &telegram_chat_id, 
-                                        &telegram_message,
-                                            &topic_ids,
+                                        send_telegram_notification(
+                                            &client, 
+                                            &telegram_bot_token, 
+                                            &telegram_chat_id, 
+                                            &telegram_message,
+                                            &telegram_found_topic_id,
                                             Some(keyboard.clone())
-                                    ).await?;
+                                        ).await?;
                                     }
                                     
                                     // Clear message for next flight
@@ -925,52 +1199,50 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
                             } else {
+                                // Update statistics
+                                stats.dates_without_flights += 1;
                                 println!("No flights found for {}", formatted_date);
-                                
-                                if enable_telegram {
-                                    let origin_name = get_city_name(&origin);
-                                    let destination_name = get_city_name(&destination);
-                                    let no_flights_message = format!("ℹ️ Рейсы не найдены на {} из {} в {}", 
-                                        formatted_date, origin_name, destination_name);
-                                    // Only send to devlogs topic
-                                    send_telegram_notification(
-                                        &client, 
-                                        &telegram_bot_token, 
-                                        &telegram_chat_id, 
-                                        &no_flights_message, 
-                                        &telegram_devlogs_topic_id,
-                                        None
-                                    ).await?;
-                                }
                             }
                         } else {
+                            // Update statistics
+                            stats.dates_without_flights += 1;
                             println!("No flights found for {}", formatted_date);
-                            
-                            if enable_telegram {
-                                let origin_name = get_city_name(&origin);
-                                let destination_name = get_city_name(&destination);
-                                let no_flights_message = format!("ℹ️ Рейсы не найдены на {} из {} в {}", 
-                                    formatted_date, origin_name, destination_name);
-                                // Only send to devlogs topic
-                                send_telegram_notification(
-                                    &client, 
-                                    &telegram_bot_token, 
-                                    &telegram_chat_id, 
-                                    &no_flights_message, 
-                                    &telegram_devlogs_topic_id,
-                                    None
-                                ).await?;
-                            }
                         }
                     }
                 }
                 Err(e) => {
+                    // Update statistics for error
+                    stats.errors_encountered += 1;
                     eprintln!("Error searching flights for {}: {}", formatted_date, e);
                     
-                    if enable_telegram {
-                        let error_message = format!("❌ Ошибка при поиске рейсов на {}: {}", 
-                            formatted_date, e);
-                        send_telegram_notification(&client, &telegram_bot_token, &telegram_chat_id, &error_message, &telegram_devlogs_topic_id, None).await?;
+                    // Only update the status message with the error, don't send a separate error notification
+                    if enable_telegram && status_message_id.is_some() {
+                        let error_update = format!(
+                            "🛫 <b>Программа поиска авиабилетов</b>\n\n\
+                            🔍 Поиск начат: {}\n\
+                            🗓 Проверяемые даты: {}\n\n\
+                            {}\n\n\
+                            ⚠️ <b>Ошибка при поиске на {}:</b> {}\n\n\
+                            <i>Поиск продолжается ({}/{} дат проверено)...</i>",
+                            formatted_start_time,
+                            date_range_str,
+                            stats.format_summary(),
+                            formatted_date,
+                            e,
+                            stats.total_dates_checked,
+                            dates.len()
+                        );
+                        
+                        if let Err(update_err) = update_telegram_message(
+                            &client,
+                            &telegram_bot_token,
+                            &telegram_chat_id,
+                            &status_message_id.as_ref().unwrap(),
+                            &error_update,
+                            &telegram_devlogs_topic_id
+                        ).await {
+                            eprintln!("Failed to update status message: {}", update_err);
+                        }
                     }
                 }
             }
@@ -981,23 +1253,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
         
         let search_end_time = Utc::now();
         let formatted_end_time = format_utc_datetime_ru(search_end_time);
+        let duration = search_end_time.signed_duration_since(search_start_time);
+        let duration_minutes = duration.num_minutes();
+        
         println!("Completed flight search cycle at {}. Waiting {} hours before next check.", formatted_end_time, hours_interval);
         
-        if enable_telegram {
-            let cycle_end_message = format!(
-                "✅ Цикл поиска прямых рейсов завершен {}.\n\
-                 Следующая проверка будет через {} часов.",
-                formatted_end_time, hours_interval
+        // Final status update with complete statistics
+        if enable_telegram && status_message_id.is_some() {
+            let final_message = format!(
+                "🛫 <b>Программа поиска авиабилетов</b>\n\n\
+                ✅ <b>Цикл поиска завершен!</b>\n\
+                🕒 Начало: {}\n\
+                🕕 Окончание: {}\n\
+                ⏱ Длительность: {} минут\n\
+                🗓 Проверено дат: {}\n\n\
+                {}\n\n\
+                🔄 Следующий цикл через <b>{} часов</b>",
+                formatted_start_time,
+                formatted_end_time,
+                duration_minutes,
+                dates.len(),
+                stats.format_summary(),
+                hours_interval
             );
-            // Only send to devlogs topic
-            send_telegram_notification(
-                &client, 
-                &telegram_bot_token, 
-                &telegram_chat_id, 
-                &cycle_end_message, 
-                &telegram_devlogs_topic_id, 
-                None
-            ).await?;
+            
+            if let Err(e) = update_telegram_message(
+                &client,
+                &telegram_bot_token,
+                &telegram_chat_id,
+                &status_message_id.as_ref().unwrap(),
+                &final_message,
+                &telegram_devlogs_topic_id
+            ).await {
+                eprintln!("Failed to update final status message: {}", e);
+            }
         }
         
         time::sleep(check_interval).await;

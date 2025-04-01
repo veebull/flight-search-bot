@@ -1,0 +1,11 @@
+version: '3'
+
+services:
+  flight-checker:
+    build: .
+    container_name: flight-checker
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
