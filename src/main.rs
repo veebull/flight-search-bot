@@ -117,8 +117,8 @@ fn format_duration(minutes: i64) -> String {
 fn format_datetime_ru(datetime_str: &str) -> String {
     // Parse the ISO 8601 datetime string
     if let Ok(dt) = DateTime::parse_from_rfc3339(datetime_str) {
-        // Convert to local time (assuming +3 for Moscow time, adjust if needed)
-        let local_time = dt.with_timezone(&FixedOffset::east_opt(3 * 3600).unwrap());
+        // Convert to local time (UTC+5)
+        let local_time = dt.with_timezone(&FixedOffset::east_opt(5 * 3600).unwrap());
         
         // Format the date in Russian
         let day = local_time.day();
@@ -320,12 +320,12 @@ async fn send_telegram_multi_topic_notification(
 
 // Enhanced function for formatting DateTime<Utc> to Russian human-readable format
 fn format_utc_datetime_ru(dt: DateTime<Utc>) -> String {
-    // Convert to Moscow time (+3)
-    let moscow_time = dt.with_timezone(&FixedOffset::east_opt(3 * 3600).unwrap());
+    // Convert to UTC+5
+    let local_time = dt.with_timezone(&FixedOffset::east_opt(5 * 3600).unwrap());
     
     // Format in Russian
-    let day = moscow_time.day();
-    let month = match moscow_time.month() {
+    let day = local_time.day();
+    let month = match local_time.month() {
         1 => "января",
         2 => "февраля",
         3 => "марта",
@@ -340,10 +340,10 @@ fn format_utc_datetime_ru(dt: DateTime<Utc>) -> String {
         12 => "декабря",
         _ => "",
     };
-    let year = moscow_time.year();
-    let hour = moscow_time.hour();
-    let minute = moscow_time.minute();
-    let second = moscow_time.second();
+    let year = local_time.year();
+    let hour = local_time.hour();
+    let minute = local_time.minute();
+    let second = local_time.second();
     
     format!("{} {} {} в {}ч {}м {}с", day, month, year, hour, minute, second)
 }
@@ -606,7 +606,7 @@ struct SearchStatistics {
     dates_without_flights: usize,
     total_flights_found: usize,
     errors_encountered: usize,
-    flight_dates: Vec<String>,
+    flight_dates: Vec<(String, String)>, // (date, message_id)
 }
 
 impl SearchStatistics {
@@ -631,8 +631,12 @@ impl SearchStatistics {
         
         if !self.flight_dates.is_empty() {
             summary.push_str("\n<b>Даты с найденными рейсами:</b>\n");
-            for date in &self.flight_dates {
-                summary.push_str(&format!("• {}\n", date));
+            for (date, message_id) in &self.flight_dates {
+                summary.push_str(&format!("• <a href=\"https://t.me/c/{}/{}\">{}</a>\n", 
+                    message_id.split('/').nth(0).unwrap_or(""),
+                    message_id.split('/').nth(1).unwrap_or(""),
+                    date
+                ));
             }
         }
         
@@ -814,6 +818,95 @@ async fn send_telegram_notification_with_id(
     }
 }
 
+// Add this new function to check for previous messages
+async fn get_previous_messages(
+    client: &Client,
+    bot_token: &str,
+    chat_id: &str,
+    topic_id: &str,
+    limit: i32,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let api_url = format!("https://api.telegram.org/bot{}/getChatHistory", bot_token);
+    
+    let mut json_body = json!({
+        "chat_id": chat_id,
+        "limit": limit
+    });
+
+    if !topic_id.is_empty() && topic_id != "1" {
+        json_body["message_thread_id"] = json!(topic_id);
+    }
+    
+    let response = client
+        .post(&api_url)
+        .json(&json_body)
+        .send()
+        .await?;
+    
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await?;
+        return Err(format!("Failed to get chat history: {} - {}", status, text).into());
+    }
+    
+    let response_text = response.text().await?;
+    let response_json: serde_json::Value = serde_json::from_str(&response_text)?;
+    
+    let mut message_ids = Vec::new();
+    if let Some(messages) = response_json.get("result").and_then(|r| r.as_array()) {
+        for message in messages {
+            if let Some(message_id) = message.get("message_id").and_then(|id| id.as_i64()) {
+                message_ids.push(message_id.to_string());
+            }
+        }
+    }
+    
+    Ok(message_ids)
+}
+
+// Add this function to check if a message was sent in the last 48 hours
+async fn was_message_sent_recently(
+    client: &Client,
+    bot_token: &str,
+    chat_id: &str,
+    topic_id: &str,
+    message_text: &str,
+) -> Result<bool, Box<dyn Error>> {
+    // Get messages from the last 48 hours
+    let previous_messages = get_previous_messages(client, bot_token, chat_id, topic_id, 100).await?;
+    
+    // Check if a similar message exists
+    for message_id in previous_messages {
+        let api_url = format!("https://api.telegram.org/bot{}/getMessage", bot_token);
+        let json_body = json!({
+            "chat_id": chat_id,
+            "message_id": message_id
+        });
+        
+        let response = client
+            .post(&api_url)
+            .json(&json_body)
+            .send()
+            .await?;
+        
+        if response.status().is_success() {
+            let response_text = response.text().await?;
+            let response_json: serde_json::Value = serde_json::from_str(&response_text)?;
+            
+            if let Some(message) = response_json.get("result").and_then(|r| r.get("text")) {
+                if let Some(text) = message.as_str() {
+                    // Compare the message text (ignoring timestamps and dynamic content)
+                    if text.contains(message_text) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(false)
+}
+
 // TODO: Create schedule checker for date from 15 sept 2025 to 30 sept 2025
 // for available dates in the aero flights aviasales.ru each 6 hours
 #[tokio::main]
@@ -869,7 +962,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .unwrap_or_else(|_| {
         println!("ORIGIN not found in environment variables.");
         String::new()
-    });; // Origin (all airports)
+    }); // Origin (all airports)
     let destination = env::var("DESTINATION")
     .unwrap_or_else(|_| {
         println!("DESTINATION not found in environment variables.");
@@ -901,7 +994,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     
     // Check flights every 6 hours
     let hours_interval = 6;
-    let check_interval = Duration::from_secs(hours_interval * 60 * 60);
+    let check_interval = Duration::from_secs(hours_interval);
     
     // Send startup notification
     if enable_telegram {
@@ -1005,198 +1098,175 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 // Update statistics
                                 stats.dates_with_flights += 1;
                                 stats.total_flights_found += flight_count;
-                                stats.flight_dates.push(formatted_date.clone());
                                 
-                                // Prepare flight details for Telegram
-                                let mut telegram_message = format!("✅ Найдено <b>{} рейсов</b> на <b>{}</b> из {} в {}:\n\n", 
-                                    flight_count, formatted_date, origin_name, destination_name);
+                                // Check if a similar message was sent recently
+                                let message_text = format!("Найдено {} рейсов на {}", flight_count, formatted_date);
+                                let was_recent = was_message_sent_recently(
+                                    &client,
+                                    &telegram_bot_token,
+                                    &telegram_chat_id,
+                                    &telegram_found_topic_id,
+                                    &message_text
+                                ).await?;
                                 
-                                // Update status message with current progress
-                                if enable_telegram && status_message_id.is_some() {
-                                    let progress_message = format!(
-                                        "🛫 <b>Программа поиска авиабилетов</b>\n\n\
-                                        🔍 Поиск начат: {}\n\
-                                        🗓 Проверяемые даты: {}\n\n\
-                                        {}\n\n\
-                                        <i>Поиск в процессе ({}/{} дат проверено)...</i>",
-                                        formatted_start_time,
-                                        date_range_str,
-                                        stats.format_summary(),
-                                        stats.total_dates_checked,
-                                        dates.len()
-                                    );
-                                    
-                                    if let Err(e) = update_telegram_message(
+                                if !was_recent {
+                                    let message_id = send_telegram_notification_with_id(
                                         &client,
                                         &telegram_bot_token,
                                         &telegram_chat_id,
-                                        &status_message_id.as_ref().unwrap(),
-                                        &progress_message,
-                                        &telegram_devlogs_topic_id
-                                    ).await {
-                                        eprintln!("Failed to update status message: {}", e);
-                                    }
-                                }
-                                
-                                // Send flight details to the FOUND_TOPIC channel
-                                for (i, flight) in flights.iter().enumerate() {
-                                    if i >= 5 {
-                                        // Limit to 5 flights in a single message
-                                        telegram_message.push_str(&format!("... и еще {} рейсов\n", flight_count - 5));
-                                        break;
-                                    }
+                                        &format!("✅ Найдено <b>{} рейсов</b> на <b>{}</b> из {} в {}:\n\n", 
+                                            flight_count, formatted_date, origin_name, destination_name),
+                                        &telegram_found_topic_id,
+                                        None
+                                    ).await?;
                                     
-                                    let origin_city = get_city_name(&flight.origin);
-                                    let destination_city = get_city_name(&flight.destination);
-                                    let airline_name = get_airline_name(&flight.airline);
-                                    let formatted_departure = format_datetime_ru(&flight.departure_at);
+                                    // Update statistics with message ID
+                                    stats.flight_dates.push((formatted_date.clone(), message_id));
                                     
-                                    telegram_message.push_str(&format!(
-                                        "🛫 <b>Рейс {}</b>: {} ({}) → {} ({})\n",
-                                        flight.flight_number,
-                                        origin_city,
-                                        flight.origin_airport,
-                                        destination_city,
-                                        flight.destination_airport
-                                    ));
-                                    
-                                    telegram_message.push_str(&format!(
-                                        "⏰ <b>Вылет</b>: {}\n",
-                                        formatted_departure
-                                    ));
-                                    
-                                    telegram_message.push_str(&format!(
-                                        "💰 <b>Примерная цена</b>: {} RUB\n",
-                                        flight.price
-                                    ));
-                                    
-                                    telegram_message.push_str(&format!(
-                                        "✈️ <b>Авиакомпания</b>: {}, <b>Пересадок</b>: {}\n",
-                                        airline_name,
-                                        flight.transfers
-                                    ));
-                                    
-                                    if let Some(seats) = flight.seats {
-                                        telegram_message.push_str(&format!(
-                                            "👥 <b>Доступно мест</b>: {}\n",
-                                            seats
-                                        ));
-                                    }
-                                    
-                                    if let Some(duration) = flight.duration {
-                                        telegram_message.push_str(&format!(
-                                            "⏱ <b>Длительность</b>: {}\n",
-                                            format_duration(duration)
-                                        ));
-                                    }
-                                    
-                                    // Create inline keyboard for this flight
-                                    let keyboard = json!({
-                                        "inline_keyboard": [
-                                            [
-                                                {
-                                                    "text": "Забронировать билет",
-                                                    "url": format!("https://aviasales.ru{}", flight.link)
-                                                }
-                                            ]
-                                        ]
-                                    });
-                                    
-                                    // Only send flight info to the FOUND topic
-                                    if enable_telegram {
-                                        send_telegram_notification(
-                                            &client, 
-                                            &telegram_bot_token, 
-                                            &telegram_chat_id, 
-                                            &telegram_message,
+                                    // Send flight details
+                                    for (i, flight) in flights.iter().enumerate() {
+                                        if i >= 5 {
+                                            // Limit to 5 flights in a single message
+                                            let message_text = format!("... и еще {} рейсов", flight_count - 5);
+                                            let was_recent = was_message_sent_recently(
+                                                &client,
+                                                &telegram_bot_token,
+                                                &telegram_chat_id,
+                                                &telegram_found_topic_id,
+                                                &message_text
+                                            ).await?;
+                                            
+                                            if !was_recent {
+                                                let message_id = send_telegram_notification_with_id(
+                                                    &client,
+                                                    &telegram_bot_token,
+                                                    &telegram_chat_id,
+                                                    &message_text,
+                                                    &telegram_found_topic_id,
+                                                    None
+                                                ).await?;
+                                            }
+                                            break;
+                                        }
+                                        
+                                        let origin_city = get_city_name(&flight.origin);
+                                        let destination_city = get_city_name(&flight.destination);
+                                        let airline_name = get_airline_name(&flight.airline);
+                                        let formatted_departure = format_datetime_ru(&flight.departure_at);
+                                        
+                                        let message_text = format!(
+                                            "🛫 <b>Рейс {}</b>: {} ({}) → {} ({})\n",
+                                            flight.flight_number,
+                                            origin_city,
+                                            flight.origin_airport,
+                                            destination_city,
+                                            flight.destination_airport
+                                        );
+                                        
+                                        let was_recent = was_message_sent_recently(
+                                            &client,
+                                            &telegram_bot_token,
+                                            &telegram_chat_id,
                                             &telegram_found_topic_id,
-                                            Some(keyboard.clone())
+                                            &message_text
                                         ).await?;
+                                        
+                                        if !was_recent {
+                                            send_telegram_notification(
+                                                &client,
+                                                &telegram_bot_token,
+                                                &telegram_chat_id,
+                                                &message_text,
+                                                &telegram_found_topic_id,
+                                                None
+                                            ).await?;
+                                        }
                                     }
                                     
-                                    // Clear message for next flight
-                                    telegram_message = String::new();
-                                }
-                                
-                                // Now process AirLabs data for each flight if enabled
-                                if enable_airlabs {
-                                    for flight in flights {
-                                        match enrich_with_airlabs_data(&client, flight, &airlabs_api_key).await {
-                                            Ok(Some(airlabs_flight)) => {
-                                                // ... existing AirLabs processing code ...
-                                                
-                                                // Send AirLabs data to both chat IDs if seat info is available
-                                                let mut has_seat_info = false;
-                                                let mut airlabs_message = String::new();
-                                                
-                                                airlabs_message.push_str(&format!(
-                                                    "📊 <b>Дополнительная информация для рейса {}{}</b>:\n",
-                                                    flight.airline, flight.flight_number
-                                                ));
-                                                
-                                                if let Some(status) = &airlabs_flight.status {
-                                                    airlabs_message.push_str(&format!("🚦 <b>Статус рейса</b>: {}\n", status));
-                                                }
-                                                
-                                                if let Some(aircraft) = &airlabs_flight.aircraft_icao {
-                                                    airlabs_message.push_str(&format!("✈️ <b>Тип самолета</b>: {}\n", aircraft));
-                                                }
-                                                
-                                                if let Some(economy) = airlabs_flight.seats_economy {
-                                                    airlabs_message.push_str(&format!("💺 <b>Мест в эконом-классе</b>: {}\n", economy));
-                                                    has_seat_info = true;
-                                                }
-                                                
-                                                if let Some(business) = airlabs_flight.seats_business {
-                                                    airlabs_message.push_str(&format!("💺 <b>Мест в бизнес-классе</b>: {}\n", business));
-                                                    has_seat_info = true;
-                                                }
-                                                
-                                                if let Some(first) = airlabs_flight.seats_first {
-                                                    airlabs_message.push_str(&format!("💺 <b>Мест в первом классе</b>: {}\n", first));
-                                                    has_seat_info = true;
-                                                }
-                                                
-                                                if !airlabs_message.is_empty() {
-                                                    // Send to primary chat ID
-                                                    if enable_telegram {
-                                                        send_telegram_notification(
-                                                            &client,
-                                                            &telegram_bot_token,
-                                                            &telegram_chat_id,
-                                                            &airlabs_message,
-                                                            &telegram_found_topic_id,
-                                                            None
-                                                        ).await?;
+                                    // Now process AirLabs data for each flight if enabled
+                                    if enable_airlabs {
+                                        for flight in flights {
+                                            match enrich_with_airlabs_data(&client, flight, &airlabs_api_key).await {
+                                                Ok(Some(airlabs_flight)) => {
+                                                    // ... existing AirLabs processing code ...
+                                                    
+                                                    // Send AirLabs data to both chat IDs if seat info is available
+                                                    let mut has_seat_info = false;
+                                                    let mut airlabs_message = String::new();
+                                                    
+                                                    airlabs_message.push_str(&format!(
+                                                        "📊 <b>Дополнительная информация для рейса {}{}</b>:\n",
+                                                        flight.airline, flight.flight_number
+                                                    ));
+                                                    
+                                                    if let Some(status) = &airlabs_flight.status {
+                                                        airlabs_message.push_str(&format!("🚦 <b>Статус рейса</b>: {}\n", status));
                                                     }
                                                     
-                                                    // Send to secondary chat ID if has seat info
-                                                    if enable_secondary_notifications && has_seat_info {
-                                                        let secondary_airlabs_message = format!(
-                                                            "🚨 <b>ИНФОРМАЦИЯ О НАЛИЧИИ МЕСТ:</b> 🚨\n\n{}",
-                                                            airlabs_message
-                                                        );
-                                                        
-                                                        send_telegram_notification(
-                                                            &client,
-                                                            &telegram_bot_token,
-                                                            &telegram_chat_id,
-                                                            &secondary_airlabs_message,
-                                                            &telegram_found_topic_id,
-                                                            None
-                                                        ).await?;
+                                                    if let Some(aircraft) = &airlabs_flight.aircraft_icao {
+                                                        airlabs_message.push_str(&format!("✈️ <b>Тип самолета</b>: {}\n", aircraft));
                                                     }
+                                                    
+                                                    if let Some(economy) = airlabs_flight.seats_economy {
+                                                        airlabs_message.push_str(&format!("💺 <b>Мест в эконом-классе</b>: {}\n", economy));
+                                                        has_seat_info = true;
+                                                    }
+                                                    
+                                                    if let Some(business) = airlabs_flight.seats_business {
+                                                        airlabs_message.push_str(&format!("💺 <b>Мест в бизнес-классе</b>: {}\n", business));
+                                                        has_seat_info = true;
+                                                    }
+                                                    
+                                                    if let Some(first) = airlabs_flight.seats_first {
+                                                        airlabs_message.push_str(&format!("💺 <b>Мест в первом классе</b>: {}\n", first));
+                                                        has_seat_info = true;
+                                                    }
+                                                    
+                                                    if !airlabs_message.is_empty() {
+                                                        // Send to primary chat ID
+                                                        if enable_telegram {
+                                                            send_telegram_notification(
+                                                                &client,
+                                                                &telegram_bot_token,
+                                                                &telegram_chat_id,
+                                                                &airlabs_message,
+                                                                &telegram_found_topic_id,
+                                                                None
+                                                            ).await?;
+                                                        }
+                                                        
+                                                        // Send to secondary chat ID if has seat info
+                                                        if enable_secondary_notifications && has_seat_info {
+                                                            let secondary_airlabs_message = format!(
+                                                                "🚨 <b>ИНФОРМАЦИЯ О НАЛИЧИИ МЕСТ:</b> 🚨\n\n{}",
+                                                                airlabs_message
+                                                            );
+                                                            
+                                                            send_telegram_notification(
+                                                                &client,
+                                                                &telegram_bot_token,
+                                                                &telegram_chat_id,
+                                                                &secondary_airlabs_message,
+                                                                &telegram_found_topic_id,
+                                                                None
+                                                            ).await?;
+                                                        }
+                                                    }
+                                                },
+                                                Ok(None) => {
+                                                    println!("No AirLabs data found for flight {}{}", 
+                                                        flight.airline, flight.flight_number);
+                                                },
+                                                Err(e) => {
+                                                    eprintln!("Error fetching AirLabs data: {}", e);
                                                 }
-                                            },
-                                            Ok(None) => {
-                                                println!("No AirLabs data found for flight {}{}", 
-                                                    flight.airline, flight.flight_number);
-                                            },
-                                            Err(e) => {
-                                                eprintln!("Error fetching AirLabs data: {}", e);
                                             }
                                         }
                                     }
+                                } else {
+                                    // Update statistics
+                                    stats.dates_without_flights += 1;
+                                    println!("No flights found for {}", formatted_date);
                                 }
                             } else {
                                 // Update statistics
@@ -1215,20 +1285,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     stats.errors_encountered += 1;
                     eprintln!("Error searching flights for {}: {}", formatted_date, e);
                     
-                    // Only update the status message with the error, don't send a separate error notification
+                    // Send a separate error message
+                    if enable_telegram {
+                        let error_message = format!(
+                            "⚠️ <b>Ошибка при поиске рейсов</b>\n\n\
+                            📅 Дата: {}\n\
+                            ❌ Ошибка: {}\n\n\
+                            <i>Поиск продолжается...</i>",
+                            formatted_date,
+                            e
+                        );
+                        
+                        if let Err(send_err) = send_telegram_notification(
+                            &client,
+                            &telegram_bot_token,
+                            &telegram_chat_id,
+                            &error_message,
+                            &telegram_devlogs_topic_id,
+                            None
+                        ).await {
+                            eprintln!("Failed to send error message: {}", send_err);
+                        }
+                    }
+                    
+                    // Update status message without the error details
                     if enable_telegram && status_message_id.is_some() {
-                        let error_update = format!(
+                        let progress_message = format!(
                             "🛫 <b>Программа поиска авиабилетов</b>\n\n\
                             🔍 Поиск начат: {}\n\
                             🗓 Проверяемые даты: {}\n\n\
                             {}\n\n\
-                            ⚠️ <b>Ошибка при поиске на {}:</b> {}\n\n\
-                            <i>Поиск продолжается ({}/{} дат проверено)...</i>",
+                            <i>Поиск в процессе ({}/{} дат проверено)...</i>",
                             formatted_start_time,
                             date_range_str,
                             stats.format_summary(),
-                            formatted_date,
-                            e,
                             stats.total_dates_checked,
                             dates.len()
                         );
@@ -1238,7 +1328,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             &telegram_bot_token,
                             &telegram_chat_id,
                             &status_message_id.as_ref().unwrap(),
-                            &error_update,
+                            &progress_message,
                             &telegram_devlogs_topic_id
                         ).await {
                             eprintln!("Failed to update status message: {}", update_err);
@@ -1255,6 +1345,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let formatted_end_time = format_utc_datetime_ru(search_end_time);
         let duration = search_end_time.signed_duration_since(search_start_time);
         let duration_minutes = duration.num_minutes();
+        let duration_seconds = duration.num_seconds();
         
         println!("Completed flight search cycle at {}. Waiting {} hours before next check.", formatted_end_time, hours_interval);
         
@@ -1265,13 +1356,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 ✅ <b>Цикл поиска завершен!</b>\n\
                 🕒 Начало: {}\n\
                 🕕 Окончание: {}\n\
-                ⏱ Длительность: {} минут\n\
+                ⏱ Длительность: {} минут {} секунд\n\
                 🗓 Проверено дат: {}\n\n\
                 {}\n\n\
                 🔄 Следующий цикл через <b>{} часов</b>",
                 formatted_start_time,
                 formatted_end_time,
                 duration_minutes,
+                duration_seconds,
                 dates.len(),
                 stats.format_summary(),
                 hours_interval
