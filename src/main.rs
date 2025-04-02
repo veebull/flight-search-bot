@@ -994,7 +994,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     
     // Check flights every 6 hours
     let hours_interval = 6;
-    let check_interval = Duration::from_secs(hours_interval);
+    let check_interval = Duration::from_secs(hours_interval * 60 * 60);
     
     // Send startup notification
     if enable_telegram {
